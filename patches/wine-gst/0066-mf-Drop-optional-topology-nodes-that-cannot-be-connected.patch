@@ -1,0 +1,70 @@
+From: Kuenec <kuenec44@gmail.com>
+Subject: [PATCH] mf: Drop optional topology nodes that cannot be connected.
+
+The media engine marks inserted effects with MF_CONNECT_AS_OPTIONAL. Windows
+removes such a node and links its neighbours when it cannot be connected;
+the loader failed the whole topology instead.
+---
+--- a/dlls/mf/topology_loader.c
++++ b/dlls/mf/topology_loader.c
+@@ -538,17 +538,42 @@
+     return hr;
+ }
+ 
++static BOOL topology_node_is_optional(IMFTopologyNode *node)
++{
++    UINT32 method;
++
++    return SUCCEEDED(IMFTopologyNode_GetUINT32(node, &MF_TOPONODE_CONNECT_METHOD, &method))
++            && (method & MF_CONNECT_AS_OPTIONAL);
++}
++
++static void topology_branches_bypass_node(struct list *branches, IMFTopologyNode *skipped,
++        struct topology_branch *branch)
++{
++    struct topology_branch *next;
++
++    LIST_FOR_EACH_ENTRY(next, branches, struct topology_branch, entry)
++    {
++        if (next->up.node != skipped)
++            continue;
++        IMFTopologyNode_Release(next->up.node);
++        IMFTopologyNode_AddRef((next->up.node = branch->up.node));
++        next->up.stream = branch->up.stream;
++    }
++}
++
+ static HRESULT topology_loader_resolve_branches(struct topoloader_context *context, struct list *branches,
+         BOOL enumerate_source_types)
+ {
+     struct list new_branches = LIST_INIT(new_branches);
+     struct topology_branch *branch, *next;
+     MF_TOPOLOGY_TYPE node_type;
++    IMFTopologyNode *down;
+     HRESULT hr = S_OK;
+ 
+     LIST_FOR_EACH_ENTRY_SAFE(branch, next, branches, struct topology_branch, entry)
+     {
+         list_remove(&branch->entry);
++        IMFTopologyNode_AddRef((down = branch->down.node));
+ 
+         if (FAILED(hr = topology_node_list_branches(branch->down.node, &new_branches)))
+             WARN("Failed to list branches from branch %s\n", debugstr_topology_branch(branch));
+@@ -561,8 +586,17 @@
+             hr = topology_branch_connect(context->output_topology, MF_CONNECT_ALLOW_DECODER, branch, enumerate_source_types);
+             if (hr == MF_E_INVALIDMEDIATYPE && !enumerate_source_types && node_type == MF_TOPOLOGY_TRANSFORM_NODE)
+                 hr = topology_branch_connect(context->output_topology, MF_CONNECT_ALLOW_DECODER, branch, TRUE);
++            if (FAILED(hr) && topology_node_is_optional(branch->down.node))
++            {
++                WARN("Skipping optional node in branch %s, hr %#lx\n", debugstr_topology_branch(branch), hr);
++                topology_branches_bypass_node(branches, down, branch);
++                topology_branches_bypass_node(&new_branches, down, branch);
++                IMFTopology_RemoveNode(context->output_topology, branch->down.node);
++                hr = S_OK;
++            }
+         }
+ 
++        IMFTopologyNode_Release(down);
+         topology_branch_destroy(branch);
+         if (FAILED(hr))
+             break;
